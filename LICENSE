@@ -1,7 +1,7 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: mytools
 Upstream-Contact: xmz-team
-Source: https://codeberg.com/xmz-team/mytools
+Source: https://codeberg.org/xmz-team/mytools
 
 Files: *
 Copyright: 2026 XMZ <xmz-team@outlook.com>
