@@ -1,0 +1,50 @@
+#!/bin/sh -
+#postinst
+unset jb
+jbdpkgarch="$(dpkg --print-architecture)"
+if [ "$jbdpkgarch" = "iphoneos-arm64" ]; then
+    jb="/var/jb"
+elif [ "$jbdpkgarch" = "iphoneos-arm64e" ]; then
+    jb="$(jbroot)"
+else
+    jb=""
+fi
+
+export jb
+
+if [ ! "${1}" = "triggered" ]; then
+    if [ ! -f "$jb/usr/bin/psoatop" ]; then
+        mkdir -p "$jb/etc/psoatop.d"
+        cat > "$jb/usr/bin/psoatop" << 'EOF'
+@psoatop_src_text@
+EOF
+        chmod 0755 "$jb/usr/bin/psoatop"
+        chown 0:0 "$jb/usr/bin/psoatop"
+    fi
+else
+    mkdir -p "$HOME/.config/psoatop/scripts"
+    config_file="$HOME/.config/psoatop/psoatop.io.github.xmz-team.json"
+    if [ ! -f "$config_file" ];then
+        cat > "$config_file" << 'ENDOFFILE'
+{
+    "annotate": "This is a list, and the suite in the list will customize the script by itself",
+    "packages_id": {}
+}
+ENDOFFILE
+    fi
+    . "$jb/etc/profile" 1>/dev/null 2>&1 || true
+    script_dir="$HOME/.config/psoatop/scripts"
+    pkg_list=$(jq -r '.packages_id | keys[]' "$config_file" 2>/dev/null || true)
+    for pkg in $pkg_list; do
+        pkg_status=$(dpkg -s "$pkg" 2>/dev/null || true)
+        if echo "$pkg_status" | grep -q "^Status:.*install"; then
+            script_name=$(jq -r --arg pkg "$pkg" '.packages_id[$pkg]' "$config_file")
+            script_full_path="$script_dir/$script_name"
+            if [ -f "$script_full_path" ]; then
+                chmod +x "$script_full_path"
+                "$script_full_path"
+                echo "psoatop run successfully for $pkg"
+            fi
+        fi
+    done
+fi

@@ -1,0 +1,12 @@
+#!/bin/sh
+psoatop_src_text=$(cat psoatop.sh)
+
+awk -v repl="$psoatop_src_text" '{gsub(/@psoatop_src_text@/, repl); print}' postinst.sh.in > psoatop/DEBIAN/postinst
+
+rm -f psoatop/DEBIAN/postrm && cp -a postrm.sh psoatop/DEBIAN/postrm
+
+chmod 755 psoatop/DEBIAN/postinst
+chmod 755 psoatop/DEBIAN/postrm
+
+dpkg-deb -b psoatop psoatop.deb
+dpkg-name psoatop.deb

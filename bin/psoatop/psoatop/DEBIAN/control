@@ -1,0 +1,8 @@
+Package: psoatop.io.github.xmz-team
+Maintainer: XMZ <xmz-team@outlook.com>
+Architecture: all
+Version: 0.1.0-1
+Depends: bash, dash, jq
+Description: Perform specific operations according to the package
+Name: psoatop
+Author: XMZ <xmz-team@outlook.com>

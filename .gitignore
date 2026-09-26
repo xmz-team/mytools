@@ -16,3 +16,4 @@ induce-code
 .git-upload/*
 git-upload
 terminal
+*.deb
