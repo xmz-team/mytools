@@ -26,4 +26,11 @@ else
 fi
 export DEEPSEEK_API_KEY="$API_KEY"
 mypath="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "$mypath/_myai" --base-url "$API_URL"
+if [ -f "${mypath}/_myai" ]; then
+    exec "$mypath/_myai" --base-url "$API_URL"
+elif [ -f "${mypath}/_myai.py" ]; then
+    exec "$mypath/_myai.py" --base-url "$API_URL"
+else
+    echo "[Error]: _myai not exist!" >&2
+    exit 1
+fi
