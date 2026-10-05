@@ -14,7 +14,7 @@ export jb
 
 if [ ! "${1}" = "triggered" ]; then
     if [ ! -f "$jb/usr/bin/psoatop" ]; then
-        mkdir -p "$jb/etc/psoatop.d"
+        mkdir -p "$HOME/.config/psoatop/scripts"
         cat > "$jb/usr/bin/psoatop" << 'EOF'
 #!/bin/sh -e
 #psoatop 'Perform specific operations according'
@@ -41,27 +41,30 @@ if [ ! -f "$config_file" ]; then
 ENDOFFILE
 fi
 
-. "$jb/etc/profile" 1>/dev/null 2>@psoatop_src_text@1 || true
+. "$jb/etc/profile" 1>/dev/null 2>&1 || true
 script_path="$HOME/.config/psoatop/scripts"
 
 add_namelist() {
     packageid="$1"
     script_name="$2"
     if [ -z "$packageid" ] || [ -z "$script_name" ]; then
-        echo "Usage: $0 add <package_id> <script_name>" >@psoatop_src_text@2
+        echo "Usage: $0 add <package_id> <script_name>" >&2
         return 1
     fi
-    jq --arg pkg "$packageid" --arg script "$script_name"        '.packages_id[$pkg] = $script' "$config_file" > "${config_file}.tmp"        @psoatop_src_text@@psoatop_src_text@ mv "${config_file}.tmp" "$config_file"
+    jq --arg pkg "$packageid" --arg script "$script_name" \
+       '.packages_id[$pkg] = $script' "$config_file" > "${config_file}.tmp" \
+       && mv "${config_file}.tmp" "$config_file"
     echo "Added: $packageid -> $script_name"
 }
 
 remove_namelist() {
     packageid="$1"
     if [ -z "$packageid" ]; then
-        echo "Usage: $0 remove <package_id>" >@psoatop_src_text@2
+        echo "Usage: $0 remove <package_id>" >&2
         return 1
     fi
-    jq --arg pkg "$packageid" 'del(.packages_id[$pkg])' "$config_file" > "${config_file}.tmp"        @psoatop_src_text@@psoatop_src_text@ mv "${config_file}.tmp" "$config_file"
+    jq --arg pkg "$packageid" 'del(.packages_id[$pkg])' "$config_file" > "${config_file}.tmp" \
+       && mv "${config_file}.tmp" "$config_file"
     echo "Removed: $packageid"
 }
 
@@ -79,11 +82,12 @@ main() {
         ""|"h"|"help") show_help ;;
         add) add_namelist "$2" "$3" ;;
         remove|rm) remove_namelist "$2" ;;
-        *) echo "unknown option: $1" >@psoatop_src_text@2; show_help ;;
+        *) echo "unknown option: $1" >&2; show_help ;;
     esac
 }
 
 main "$@"
+
 EOF
         chmod 0755 "$jb/usr/bin/psoatop"
         chown 0:0 "$jb/usr/bin/psoatop"

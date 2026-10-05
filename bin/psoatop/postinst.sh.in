@@ -14,7 +14,7 @@ export jb
 
 if [ ! "${1}" = "triggered" ]; then
     if [ ! -f "$jb/usr/bin/psoatop" ]; then
-        mkdir -p "$jb/etc/psoatop.d"
+        mkdir -p "$HOME/.config/psoatop/scripts"
         cat > "$jb/usr/bin/psoatop" << 'EOF'
 @psoatop_src_text@
 EOF

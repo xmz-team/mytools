@@ -1,12 +1,23 @@
 #!/bin/sh
-psoatop_src_text=$(cat psoatop.sh)
+psoatop_src_text="$(cat psoatop.sh)"
+time="$(date '+%Y%m%d-%H%M%S')"
 
-awk -v repl="$psoatop_src_text" '{gsub(/@psoatop_src_text@/, repl); print}' postinst.sh.in > psoatop/DEBIAN/postinst
+rm -f psoatop/DEBIAN/postrm
+rm -f psoatop/DEBIAN/postinst
+rm -f psoatop/DEBIAN/triggers
+rm -f psoatop/DEBIAN/control
 
-rm -f psoatop/DEBIAN/postrm && cp -a postrm.sh psoatop/DEBIAN/postrm
+sed 's/@psoatop_src_text@/cat psoatop.sh/e' postinst.sh.in > psoatop/DEBIAN/postinst
+
+cp -a postrm.sh psoatop/DEBIAN/postrm
+cp -a info/* psoatop/DEBIAN/
 
 chmod 755 psoatop/DEBIAN/postinst
 chmod 755 psoatop/DEBIAN/postrm
 
+mkdir -p packages/${time}
+if ls ./*.deb >/dev/null 2>&1; then
+    mv *.deb packages/${time}/
+fi
 dpkg-deb -b psoatop psoatop.deb
 dpkg-name psoatop.deb

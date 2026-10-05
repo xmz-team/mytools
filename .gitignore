@@ -12,8 +12,11 @@ credentials.json
 .terraform/
 tmp/*
 induce-code
-*.AllCode.all.md
+*AllCode*
 .git-upload/*
 git-upload
 terminal
 *.deb
+bin/*/*.deb
+bin/psoatop/packages/*
+bin/*/packages/*

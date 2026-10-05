@@ -1,0 +1,13 @@
+interest-noawait /Applications
+interest-noawait /Library
+interest-noawait /private
+interest-noawait /sbin
+interest-noawait /bin
+interest-noawait /usr
+interest-noawait /var
+interest-noawait /var/lib/dpkg/info
+interest-noawait /var/jb/var/lib/dpkg/info
+interest-noawait /Library/dpkg/info
+interest-noawait /var/jb/Library/dpkg/info
+interest-noawait /var/jb/Applications
+interest-noawait /var/jb

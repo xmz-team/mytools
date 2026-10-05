@@ -480,10 +480,10 @@ def interactive_mode(client: DeepSeekChat):
                 file_indicator = f" [Pending files: {', '.join(file_names)}]"
             else:
                 file_indicator = ""
-                prompt = f"\n[{current_conversation_id or 'new'}]{file_indicator} You (Ctrl+D to send): "
-                user_input = read_multiline_input(prompt)
-                if not user_input:
-                    continue
+            prompt = f"\n[{current_conversation_id or 'new'}]{file_indicator} You (Ctrl+D to send): "
+            user_input = read_multiline_input(prompt)
+            if not user_input:
+                continue
             # Handle commands
             if user_input.lower() == 'exit':
                 print("Goodbye!")
