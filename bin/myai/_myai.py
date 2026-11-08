@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# _myai.py
 
 import os
 import json
@@ -7,38 +8,44 @@ import hashlib
 import time
 import sys
 import shutil
+import uuid
+import mimetypes
+import base64
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import argparse
 import requests
 
+
 class DeepSeekChat:
-    def __init__(self, api_key: str, base_url: str = "https://api.deepseek.com/v1"):
-        """
-        Initialize the DeepSeek client
-        Args:
-          api_key: DeepSeek API key
-          base_url: API base URL
-        """
+    def __init__(self, api_key: str, base_url: str = "https://api.deepseek.com", model: str = "deepseek-flash"):
         self.api_key = api_key
-        self.base_url = base_url
-        self.data_dir = Path.home() / '.my' / 'deepseek'
-        self.history_file = self.data_dir / 'history.json'
-        self.db_file = self.data_dir / 'file.db'
-        self.upload_dir = self.data_dir / 'uploads'
-        self._setup_directories()
-        self._init_database()
-        self.history = self._load_history()
-
-    def _setup_directories(self):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.data_dir = Path.home() / ".my" / "deepseek" / "data"
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.upload_dir.mkdir(parents=True, exist_ok=True)
+        self.current_conv_id: Optional[str] = None
+        self.thinking_enabled = False  # default: thinking OFF
+        self._load_conv_index()
 
-    def _init_database(self):
-        conn = sqlite3.connect(str(self.db_file))
-        cursor = conn.cursor()
-        cursor.execute('''
+    # ---------- per-conversation storage ----------
+    def _conv_dir(self, conv_id: str) -> Path:
+        d = self.data_dir / conv_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "upload").mkdir(exist_ok=True)
+        return d
+
+    def _db_path(self, conv_id: str) -> Path:
+        return self._conv_dir(conv_id) / "file.db"
+
+    def _history_path(self, conv_id: str) -> Path:
+        return self._conv_dir(conv_id) / "history.json"
+
+    def _init_db(self, conv_id: str):
+        conn = sqlite3.connect(str(self._db_path(conv_id)))
+        c = conn.cursor()
+        c.execute("""
             CREATE TABLE IF NOT EXISTS files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 original_name TEXT NOT NULL,
@@ -46,666 +53,462 @@ class DeepSeekChat:
                 file_path TEXT NOT NULL,
                 file_size INTEGER,
                 mime_type TEXT,
-                checksum TEXT,
-                conversation_id TEXT,
+                file_id TEXT,
                 uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        ''')
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_conversation_id 
-            ON files(conversation_id)
-        ''')
+        """)
         conn.commit()
         conn.close()
 
-    def _load_history(self) -> List[Dict[str, Any]]:
-        if self.history_file.exists():
+    def _load_conv_index(self):
+        pass  # conversations are discovered from directory listing
+
+    def _load_history(self, conv_id: str) -> List[Dict[str, Any]]:
+        p = self._history_path(conv_id)
+        if p.exists():
             try:
-                with open(self.history_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"Failed to load history: {e}")
+                return json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
                 return []
         return []
 
-    def _save_history(self):
-        try:
-            with open(self.history_file, 'w', encoding='utf-8') as f:
-                json.dump(self.history, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"Failed to save the history: {e}")
+    def _save_history(self, conv_id: str, history: List[Dict[str, Any]]):
+        self._history_path(conv_id).write_text(
+            json.dumps(history, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
 
-    def _calculate_checksum(self, file_path: str) -> str:
-        sha256_hash = hashlib.sha256()
-        with open(file_path, "rb") as f:
-            for byte_block in iter(lambda: f.read(4096), b""):
-                sha256_hash.update(byte_block)
-        return sha256_hash.hexdigest()
+    def _list_conversation_ids(self) -> List[str]:
+        ids = []
+        if self.data_dir.exists():
+            for d in sorted(self.data_dir.iterdir()):
+                if d.is_dir() and (d / "history.json").exists():
+                    ids.append(d.name)
+        return ids
 
-    def _get_mime_type(self, file_path: str) -> str:
-        import mimetypes
-        mime_type, _ = mimetypes.guess_type(file_path)
-        if mime_type:
-            return mime_type
-        return 'application/octet-stream'
+    # ---------- file helpers ----------
+    def _sha256(self, path: Path) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
 
-    def upload_file(self, file_path: str, conversation_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Upload the file and record it to the database
-        Args:
-            file_path: The file path to be uploaded
-            conversation_id: Associated conversation ID
-        Returns: File Info Dictionary
-        """
-        file_path = Path(file_path)
-        if not file_path.exists():
-            raise FileNotFoundError(f"The file does not exist: {file_path}")
-        if not file_path.is_file():
-            raise ValueError(f"The path is not a file: {file_path}")
-        file_size = file_path.stat().st_size
-        checksum = self._calculate_checksum(str(file_path))
-        mime_type = self._get_mime_type(str(file_path))
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        original_name = file_path.name
-        if '.' in original_name:
-            name, ext = original_name.rsplit('.', 1)
-            stored_name = f"{name}_{timestamp}.{ext}"
-        else:
-            stored_name = f"{original_name}_{timestamp}"
-        dest_path = self.upload_dir / stored_name
-        shutil.copy2(str(file_path), str(dest_path))
-        conn = sqlite3.connect(str(self.db_file))
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO files (original_name, stored_name, file_path, file_size, mime_type, checksum, conversation_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (original_name, stored_name, str(dest_path), file_size, mime_type, checksum, conversation_id))
-        file_id = cursor.lastrowid
+    def _mime(self, path: Path) -> str:
+        mt, _ = mimetypes.guess_type(str(path))
+        return mt or "application/octet-stream"
+
+    def _upload_via_api(self, path: Path) -> Optional[str]:
+        """Upload image to DeepSeek Files API, return file_id."""
+        url = f"{self.base_url}/files"
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        with open(path, "rb") as f:
+            files = {"file": (path.name, f, self._mime(path))}
+            data = {"purpose": "user_data"}
+            try:
+                r = requests.post(url, headers=headers, files=files, data=data, timeout=120)
+                r.raise_for_status()
+                return r.json().get("id")
+            except requests.exceptions.RequestException as e:
+                print(f"[warn] Files API upload failed: {e}")
+                return None
+
+    def upload_file(self, file_path: str, conv_id: str) -> Dict[str, Any]:
+        src = Path(file_path).expanduser().resolve()
+        if not src.exists() or not src.is_file():
+            raise FileNotFoundError(f"not a file: {src}")
+        size = src.stat().st_size
+        checksum = self._sha256(src)
+        mime = self._mime(src)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stored = f"{src.stem}_{ts}{src.suffix}"
+        dest = self._conv_dir(conv_id) / "upload" / stored
+        shutil.copy2(src, dest)
+
+        # Try Files API for image types
+        api_file_id = None
+        if mime.startswith("image/") and mime in ("image/jpeg", "image/png", "image/gif", "image/webp"):
+            api_file_id = self._upload_via_api(dest)
+
+        conn = sqlite3.connect(str(self._db_path(conv_id)))
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO files (original_name, stored_name, file_path, file_size, mime_type, file_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (src.name, stored, str(dest), size, mime, api_file_id))
+        fid = c.lastrowid
         conn.commit()
         conn.close()
-        file_info = {
-            'id': file_id,
-            'original_name': original_name,
-            'stored_name': stored_name,
-            'file_path': str(dest_path),
-            'file_size': file_size,
-            'mime_type': mime_type,
-            'checksum': checksum,
-            'conversation_id': conversation_id
+        return {
+            "id": fid,
+            "original_name": src.name,
+            "stored_name": stored,
+            "file_path": str(dest),
+            "file_size": size,
+            "mime_type": mime,
+            "api_file_id": api_file_id,
         }
-        print(f"The file has been uploaded: {original_name} -> {stored_name}")
-        return file_info
 
-    def _read_file_content(self, file_path: str) -> str:
-        file_path = Path(file_path)
-        try:
-            with open(file_path, 'rb') as f:
-                raw_bytes = f.read()
-            return raw_bytes.decode('latin-1')
-        except Exception as e:
-            return f"[Failed to read the file: {file_path.name}, error: {str(e)}]"
-
-    def chat(self, message: str, file_paths: Optional[List[str]] = None, 
-             conversation_id: Optional[str] = None, stream: bool = True,
-             retry_message_index: Optional[int] = None) -> str:
-        """
-        Send a message to DeepSeek
-        Args:
-            message: User message
-            file_paths: List of file paths
-            conversation_id: Conversation ID
-            stream: Whether to use streaming output
-            retry_message_index: Index of the message to retry (starting from 0), if specified, retry that message
-        Returns:
-            AI reply content
-        """
-        if retry_message_index is not None and conversation_id:
-            messages = self._get_conversation_messages(conversation_id)
-            if retry_message_index < len(messages):
-                user_msg = messages[retry_message_index]
-                if user_msg.get('role') == 'user':
-                    messages = messages[:retry_message_index]
-                    self._truncate_conversation(conversation_id, retry_message_index)
-                    return self._send_chat_request(
-                        message=user_msg['content'],
-                        file_paths=file_paths,
-                        messages=messages,
-                        conversation_id=conversation_id,
-                        stream=stream
-                    )
-                else:
-                    print("Error: The specified index is not a user message")
-                    return ""
+    def _build_content_with_files(self, text: str, file_paths: List[str], conv_id: str) -> Any:
+        """Return either plain string or list-of-blocks for chat completions."""
+        if not file_paths:
+            return text
+        blocks = []
+        if text:
+            blocks.append({"type": "text", "text": text})
+        for fp in file_paths:
+            info = self.upload_file(fp, conv_id)
+            mime = info["mime_type"]
+            if info["api_file_id"] and mime.startswith("image/"):
+                blocks.append({"type": "file", "file_id": info["api_file_id"]})
+            elif mime.startswith("image/"):
+                # fallback: base64 inline
+                b64 = base64.b64encode(Path(info["file_path"]).read_bytes()).decode()
+                blocks.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"}
+                })
             else:
-                print(f"Error: Message index {retry_message_index} is out of range")
-                return ""
-        return self._send_chat_request(
-            message=message,
-            file_paths=file_paths,
-            messages=None,
-            conversation_id=conversation_id,
-            stream=stream
-        )
-
-    def _send_chat_request(self, message: str, file_paths: Optional[List[str]] = None,
-                          messages: Optional[List[Dict[str, str]]] = None,
-                          conversation_id: Optional[str] = None,
-                          stream: bool = True) -> str:
-        content = message
-        if file_paths:
-            file_contents = []
-            for file_path in file_paths:
+                # text file: read as text and embed
                 try:
-                    file_info = self.upload_file(file_path, conversation_id)
-                    file_content = self._read_file_content(file_path)
-                    file_contents.append(f"File: {file_info['original_name']}\nContent:\n{file_content}")
-                except Exception as e:
-                    print(f"Failed to process the file {file_path}: {e}")
-            if file_contents:
-                content = f"{message}\n\n--- Additional file content ---\n" + "\n\n".join(file_contents)
-        if messages is None:
-            messages = self._get_conversation_messages(conversation_id) if conversation_id else []
-        messages.append({"role": "user", "content": content})
+                    txt = Path(info["file_path"]).read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    txt = "[binary file]"
+                blocks.append({"type": "text", "text": f"\n--- File: {info['original_name']} ---\n{txt}\n"})
+        return blocks
+
+    # ---------- chat ----------
+    def _post_chat(self, messages: List[Dict], stream: bool = True) -> Tuple[str, Dict]:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
-        data = {
-            "model": "deepseek-v4-pro",
+        payload = {
+            "model": self.model,
             "messages": messages,
-            "stream": stream
+            "stream": stream,
+            "thinking": {"type": "enabled" if self.thinking_enabled else "disabled"},
         }
-        try:
-            response = requests.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json=data,
-                stream=stream
-            )
-            response.raise_for_status()
-            if stream:
-                assistant_message = self._handle_stream_response(response)
-            else:
-                result = response.json()
-                assistant_message = result['choices'][0]['message']['content']
-            if conversation_id:
-                self._save_conversation(
-                    conversation_id=conversation_id,
-                    user_message=content,
-                    assistant_message=assistant_message,
-                    append=True
-                )
-            else:
-                self._save_conversation(
-                    conversation_id=None,
-                    user_message=content,
-                    assistant_message=assistant_message,
-                    append=False
-                )
-            return assistant_message
-        except requests.exceptions.RequestException as e:
-            error_msg = f"API request failed: {e}"
-            print(error_msg)
-            return error_msg
-
-    def _truncate_conversation(self, conversation_id: str, keep_until_index: int):
-        for conv in self.history:
-            if conv.get('id') == conversation_id:
-                messages = conv.get('messages', [])
-                conv['messages'] = messages[:keep_until_index]
-                conv['updated_at'] = datetime.now().isoformat()
-                self._save_history()
-                break
-
-    def _get_conversation_messages(self, conversation_id: str) -> List[Dict[str, str]]:
-        for conv in self.history:
-            if conv.get('id') == conversation_id:
-                return conv.get('messages', [])
-        return []
-
-    def get_message_history(self, conversation_id: str) -> List[Dict[str, str]]:
-        return self._get_conversation_messages(conversation_id)
-
-    def get_conversations(self) -> List[Dict[str, Any]]:
-        return self.history
-
-    def _handle_stream_response(self, response) -> str:
-        full_message = ""
-        for line in response.iter_lines():
-            if line:
-                line = line.decode('utf-8')
-                if line.startswith('data: '):
-                    data_str = line[6:]
-                    if data_str == '[DONE]':
+        resp = requests.post(
+            f"{self.base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+            stream=stream,
+            timeout=300,
+        )
+        resp.raise_for_status()
+        if stream:
+            full = ""
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                line = line.decode("utf-8")
+                if line.startswith("data: "):
+                    data = line[6:]
+                    if data == "[DONE]":
                         break
                     try:
-                        data = json.loads(data_str)
-                        if 'choices' in data and len(data['choices']) > 0:
-                            delta = data['choices'][0].get('delta', {})
-                            content = delta.get('content', '')
-                            if content:
-                                print(content, end='', flush=True)
-                                full_message += content
-                    except json.JSONDecodeError:
-                        continue
-        print()
-        return full_message
-
-    def _save_conversation(self, conversation_id: Optional[str], 
-                          user_message: str, assistant_message: str,
-                          append: bool = True):
-        if not conversation_id:
-            conversation_id = f"conv_{int(time.time())}"
-        conv_index = None
-        for i, conv in enumerate(self.history):
-            if conv.get('id') == conversation_id:
-                conv_index = i
-                break
-        if conv_index is not None:
-            if append:
-                self.history[conv_index]['messages'].append({
-                    "role": "user",
-                    "content": user_message,
-                    "timestamp": datetime.now().isoformat()
-                })
-                self.history[conv_index]['messages'].append({
-                    "role": "assistant",
-                    "content": assistant_message,
-                    "timestamp": datetime.now().isoformat()
-                })
-            else:
-                self.history[conv_index]['messages'].append({
-                    "role": "assistant",
-                    "content": assistant_message,
-                    "timestamp": datetime.now().isoformat()
-                })
-            self.history[conv_index]['updated_at'] = datetime.now().isoformat()
-        else:
-            self.history.append({
-                'id': conversation_id,
-                'title': user_message[:50] + ('...' if len(user_message) > 50 else ''),
-                'created_at': datetime.now().isoformat(),
-                'updated_at': datetime.now().isoformat(),
-                'messages': [
-                    {
-                        "role": "user",
-                        "content": user_message,
-                        "timestamp": datetime.now().isoformat()
-                    },
-                    {
-                        "role": "assistant",
-                        "content": assistant_message,
-                        "timestamp": datetime.now().isoformat()
-                    }
-                ]
-            })
-        self._save_history()
-
-    def list_conversations(self):
-        if not self.history:
-            print("No conversation history yet")
-            return
-        print(f"\n{'ID':<20} {'Title':<40} {'Created At':<20} {'Message Count':<10}")
-        print("-" * 90)
-        for conv in self.history:
-            msg_count = len(conv.get('messages', [])) // 2
-            print(f"{conv['id']:<20} {conv['title']:<40} {conv['created_at'][:19]:<20} {msg_count:<10}")
-
-    def show_conversation(self, conversation_id: str):
-        """Display the details of a specific conversation"""
-        for conv in self.history:
-            if conv.get('id') == conversation_id:
-                print(f"\nConversation: {conv['title']}")
-                print(f"Created At: {conv['created_at']}")
-                print(f"Updated At: {conv['updated_at']}")
-                print("-" * 80)
-                messages = conv.get('messages', [])
-                for idx, msg in enumerate(messages):
-                    role = "User" if msg['role'] == 'user' else "AI"
-                    print(f"\n[{idx}] [{role}] {msg.get('timestamp', '')}")
-                    # Truncate long content for display
-                    content = msg['content']
-                    if len(content) > 500:
-                        content = content[:500] + "... (content truncated)"
-                    print(content)
-                    print("-" * 40)
-                return
-        print(f"Conversation not found: {conversation_id}")
-
-    def delete_conversation(self, conversation_id: str):
-        """Delete a specific conversation"""
-        for i, conv in enumerate(self.history):
-            if conv.get('id') == conversation_id:
-                del self.history[i]
-                self._save_history()
-                print(f"Deleted conversation: {conversation_id}")
-                return
-        print(f"Conversation not found: {conversation_id}")
-
-def main():
-    """Main function"""
-    parser = argparse.ArgumentParser(description='DeepSeek Chat CLI Tool')
-    parser.add_argument('--api-key', help='DeepSeek API key (can also be set via DEEPSEEK_API_KEY environment variable)')
-    parser.add_argument('--base-url', default='https://api.deepseek.com/v1', help='API base URL')
-    subparsers = parser.add_subparsers(dest='command', help='Command')
-    # Chat command
-    chat_parser = subparsers.add_parser('chat', help='Send a message')
-    chat_parser.add_argument('message', help='User message')
-    chat_parser.add_argument('-f', '--file', action='append', help='File path to upload (can be used multiple times)')
-    chat_parser.add_argument('-c', '--conversation', help='Conversation ID (continue an existing conversation)')
-    chat_parser.add_argument('--no-stream', action='store_true', help='Disable streaming output')
-    chat_parser.add_argument('--retry', type=int, help='Retry the message at the specified index')
-    # List command
-    list_parser = subparsers.add_parser('list', help='List conversation history')
-    # Show command
-    show_parser = subparsers.add_parser('show', help='Show conversation details')
-    show_parser.add_argument('conversation_id', help='Conversation ID')
-    # Delete command
-    delete_parser = subparsers.add_parser('delete', help='Delete a conversation')
-    delete_parser.add_argument('conversation_id', help='Conversation ID')
-    # Files command
-    files_parser = subparsers.add_parser('files', help='List uploaded files')
-    files_parser.add_argument('-c', '--conversation', help='Filter by conversation ID')
-    args = parser.parse_args()
-    # Get API Key
-    api_key = args.api_key or os.environ.get('DEEPSEEK_API_KEY')
-    if not api_key:
-        print("Error: Please set the DEEPSEEK_API_KEY environment variable or use the --api-key argument")
-        print("Example: export DEEPSEEK_API_KEY='your-api-key'")
-        sys.exit(1)
-    # Create client
-    client = DeepSeekChat(api_key=api_key, base_url=args.base_url)
-    # Execute command
-    if args.command == 'chat':
-        client.chat(
-            message=args.message,
-            file_paths=args.file,
-            conversation_id=args.conversation,
-            stream=not args.no_stream,
-            retry_message_index=args.retry
-        )
-    elif args.command == 'list':
-        client.list_conversations()
-    elif args.command == 'show':
-        client.show_conversation(args.conversation_id)
-    elif args.command == 'delete':
-        client.delete_conversation(args.conversation_id)
-    elif args.command == 'files':
-        client.list_files(args.conversation)
-    else:
-        # Default to interactive mode
-        interactive_mode(client)
-
-def read_multiline_input(prompt: str) -> str:
-    print(prompt, end='', flush=True)
-    lines = []
-    while True:
-        try:
-            line = input()
-        except EOFError:
+                        obj = json.loads(data)
+                        delta = obj["choices"][0].get("delta", {})
+                        piece = delta.get("content", "")
+                        if piece:
+                            print(piece, end="", flush=True)
+                            full += piece
+                    except Exception:
+                        pass
             print()
-            break
-        lines.append(line)
-    text = '\n'.join(lines).strip()
-    if not text:
-        return ""
-    first_line = lines[0].strip()
-    single_line_commands = {
-        'exit', 'help', 'new', 'list', 'retry', 'r',
-        'messages', 'msgs', 'file-upload-only', 'fuo',
-        'show-files', 'sf', 'clear-files', 'cf',
-    }
-    first_word = first_line.split()[0].lower() if first_line else ''
-    is_command = (
-        first_word in single_line_commands
-        or first_line.startswith(('show ', 'use ', 'file ', 'remove-file ', 'rf '))
-    )
-    if is_command:
-        return first_line
-    return text
+            return full, {}
+        else:
+            obj = resp.json()
+            return obj["choices"][0]["message"]["content"], obj.get("usage", {})
 
+    def chat(self, text: str, file_paths: Optional[List[str]] = None,
+             conv_id: Optional[str] = None, stream: bool = True) -> str:
+        # ensure conversation
+        if conv_id is None:
+            conv_id = str(uuid.uuid4())
+        self._init_db(conv_id)
+        history = self._load_history(conv_id)
+
+        content = self._build_content_with_files(text or "", file_paths or [], conv_id)
+
+        # append user message
+        if content:
+            history.append({"role": "user", "content": content})
+
+        # loop until non-empty assistant reply
+        while True:
+            reply, usage = self._post_chat(history, stream=stream)
+            if reply.strip():
+                break
+            print("[empty reply, retrying...]")
+
+        history.append({"role": "assistant", "content": reply})
+        self._save_history(conv_id, history)
+        self.current_conv_id = conv_id
+        return reply
+
+    def retry(self, conv_id: str, msg_index: int, stream: bool = True) -> str:
+        history = self._load_history(conv_id)
+        if msg_index < 0 or msg_index >= len(history):
+            print(f"Index out of range (0-{len(history)-1})")
+            return ""
+        target = history[msg_index]
+        if target["role"] == "user":
+            prefix = history[:msg_index]
+            history = prefix + [target]
+        elif target["role"] == "assistant":
+            if msg_index == 0 or history[msg_index - 1]["role"] != "user":
+                print("Cannot retry an assistant message without preceding user message")
+                return ""
+            history = history[:msg_index]
+        else:
+            print(f"Unsupported role: {target['role']}")
+            return ""
+
+        self._save_history(conv_id, history)
+        while True:
+            reply, _ = self._post_chat(history, stream=stream)
+            if reply.strip():
+                break
+            print("[empty reply, retrying...]")
+        history.append({"role": "assistant", "content": reply})
+        self._save_history(conv_id, history)
+        return reply
+
+    # ---------- token / balance ----------
+    def look_token(self) -> Dict[str, Any]:
+        url = f"{self.base_url}/user/balance"
+        headers = {"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"}
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            print(f"\nBalance available: {data.get('is_available')}")
+            for b in data.get("balance_infos", []):
+                print(f"  {b.get('currency')}: total={b.get('total_balance')} granted={b.get('granted_balance')} topped={b.get('topped_up_balance')}")
+            return data
+        except requests.exceptions.RequestException as e:
+            print(f"Failed to query balance: {e}")
+            return {"error": str(e)}
+
+    # ---------- conversation management ----------
+    def list_conversations(self):
+        ids = self._list_conversation_ids()
+        if not ids:
+            print("No conversations.")
+            return
+        print(f"\n{'ID':<40} {'Messages':<10} {'Last updated':<25}")
+        print("-" * 80)
+        for cid in ids:
+            h = self._load_history(cid)
+            n = len(h)
+            mtime = datetime.fromtimestamp(self._history_path(cid).stat().st_mtime).isoformat()[:19]
+            print(f"{cid:<40} {n:<10} {mtime:<25}")
+
+    def show_conversation(self, conv_id: str):
+        h = self._load_history(conv_id)
+        if not h:
+            print(f"Conversation {conv_id} not found or empty.")
+            return
+        print(f"\nConversation: {conv_id}\n" + "-" * 70)
+        for i, msg in enumerate(h):
+            role = "User" if msg["role"] == "user" else "AI"
+            content = msg["content"]
+            if isinstance(content, list):
+                preview = "[multi-modal content]"
+            else:
+                preview = content[:300] + ("..." if len(content) > 300 else "")
+            print(f"[{i}] {role}: {preview}")
+            print("-" * 40)
+
+    def delete_conversation(self, conv_id: str):
+        d = self.data_dir / conv_id
+        if d.exists():
+            shutil.rmtree(d)
+            print(f"Deleted: {conv_id}")
+        else:
+            print(f"Not found: {conv_id}")
+
+
+# ---------- interactive ----------
 def interactive_mode(client: DeepSeekChat):
-    """Interactive mode"""
-    print("=" * 36)
-    print("DeepSeek Chat Interactive Mode")
-    print("Type 'help' for help, 'exit' to quit")
-    print("=" * 36)
-    current_conversation_id = None
-    pending_files = []  # List of files waiting to be sent
+    print("DeepSeek Chat — type :help for commands, :exit to quit")
+    current_conv = None
+    pending_files: List[str] = []
+
     while True:
         try:
-            # Display prompt
+            prompt = f"\n[{'new' if not current_conv else current_conv}]"
             if pending_files:
-                file_names = [Path(f).name for f in pending_files]
-                file_indicator = f" [Pending files: {', '.join(file_names)}]"
-            else:
-                file_indicator = ""
-            prompt = f"\n[{current_conversation_id or 'new'}]{file_indicator} You (Ctrl+D to send): "
-            user_input = read_multiline_input(prompt)
-            if not user_input:
+                prompt += f" [files: {', '.join(Path(f).name for f in pending_files)}]"
+            prompt += " > "
+            line = input(prompt).strip()
+            if not line:
                 continue
-            # Handle commands
-            if user_input.lower() == 'exit':
-                print("Goodbye!")
+
+            # ---- commands ----
+            if line == ":exit":
+                print("Bye.")
                 break
-            elif user_input.lower() == 'help':
-                show_help()
+            if line == ":help":
+                print_help()
                 continue
-            elif user_input.lower() == 'new':
-                current_conversation_id = None
-                pending_files = []  # Clear pending files
-                print("New conversation created")
+            if line == ":new":
+                current_conv = None
+                pending_files.clear()
+                print("New conversation.")
                 continue
-            elif user_input.lower() == 'list':
+            if line == ":list":
                 client.list_conversations()
                 continue
-            elif user_input.lower().startswith('show '):
-                conv_id = user_input[5:].strip()
-                client.show_conversation(conv_id)
+            if line.startswith(":show "):
+                client.show_conversation(line[6:].strip())
                 continue
-            elif user_input.lower().startswith('use '):
-                current_conversation_id = user_input[4:].strip()
-                pending_files = []  # Clear pending files when switching conversations
-                print(f"Switched to conversation: {current_conversation_id}")
-                continue
-            # Retry commands
-            elif user_input.lower().startswith('retry ') or user_input.lower().startswith('r '):
-                try:
-                    # Extract index
-                    parts = user_input.split()
-                    if len(parts) < 2:
-                        print("Usage: retry <message_index> or r <message_index>")
-                        continue
-                    msg_index = int(parts[1])
-                    if not current_conversation_id:
-                        print("Please select a conversation first (use 'use <conversation_id>')")
-                        continue
-                    # Get message history
-                    messages = client.get_message_history(current_conversation_id)
-                    if msg_index >= len(messages):
-                        print(f"Message index {msg_index} is out of range (0-{len(messages)-1})")
-                        continue
-                    # Show the message to retry
-                    msg = messages[msg_index]
-                    if msg.get('role') != 'user':
-                        print("Only user messages can be retried")
-                        continue
-                    print(f"\nRetrying message [{msg_index}]:")
-                    print(msg['content'][:200] + ("..." if len(msg['content']) > 200 else ""))
-                    print("\nGenerating new reply...")
-                    # Execute retry
-                    print("AI: ", end='')
-                    client.chat(
-                        message="",  # Empty message, will use history
-                        conversation_id=current_conversation_id,
-                        retry_message_index=msg_index
-                    )
-                except ValueError:
-                    print("Please provide a valid message index, e.g.: retry 2")
-                except Exception as e:
-                    print(f"Retry failed: {e}")
-                continue
-            # Quick retry of the last message
-            elif user_input.lower() == 'retry' or user_input.lower() == 'r':
-                if not current_conversation_id:
-                    print("Please select a conversation first (use 'use <conversation_id>')")
-                    continue
-                messages = client.get_message_history(current_conversation_id)
-                if not messages:
-                    print("No messages in the conversation")
-                    continue
-                # Find the last user message
-                last_user_idx = None
-                for i in range(len(messages) - 1, -1, -1):
-                    if messages[i].get('role') == 'user':
-                        last_user_idx = i
-                        break
-                if last_user_idx is None:
-                    print("No user message found")
-                    continue
-                # Check if there's already an AI reply after the user message
-                if last_user_idx + 1 < len(messages) and messages[last_user_idx + 1].get('role') == 'assistant':
-                    print(f"Retrying last message [{last_user_idx}]")
-                    print("Generating new reply...")
-                    print("AI: ", end='')
-                    client.chat(
-                        message="",
-                        conversation_id=current_conversation_id,
-                        retry_message_index=last_user_idx
-                    )
-                else:
-                    print("The last user message has no reply yet, cannot retry")
-                continue
-            # Show conversation message list
-            elif user_input.lower() == 'messages' or user_input.lower() == 'msgs':
-                if not current_conversation_id:
-                    print("Please select a conversation first (use 'use <conversation_id>')")
-                    continue
-                messages = client.get_message_history(current_conversation_id)
-                if not messages:
-                    print("No messages in the conversation")
-                    continue
-                print(f"\nConversation message list ({len(messages)} messages):")
-                print("-" * 60)
-                for idx, msg in enumerate(messages):
-                    role = "User" if msg['role'] == 'user' else "AI"
-                    content_preview = msg['content'][:50] + ("..." if len(msg['content']) > 50 else "")
-                    print(f"[{idx}] {role}: {content_preview}")
-                print("-" * 60)
-                print("Use 'retry <index>' to retry a specific message")
-                continue
-            # File upload related commands
-            elif user_input.lower().startswith('file-upload-only ') or user_input.lower().startswith('fuo '):
-                # Extract file paths after the command
-                cmd_end = user_input.index(' ') + 1
-                file_paths_str = user_input[cmd_end:].strip()
-                # Support multiple file paths separated by spaces
-                file_paths = file_paths_str.split()
-                if file_paths:
-                    success_count = 0
-                    for file_path in file_paths:
-                        try:
-                            file_info = client.upload_file(file_path, current_conversation_id)
-                            pending_files.append(file_path)
-                            print(f"✓ Added: {file_info['original_name']}")
-                            success_count += 1
-                        except Exception as e:
-                            print(f"✗ Upload failed: {file_path} - {e}")
-                    print(f"Successfully added {success_count}/{len(file_paths)} files, current pending files: {len(pending_files)}")
-                else:
-                    print("Please provide file paths, e.g.: fuo file1.txt file2.md")
-                continue
-            elif user_input.lower() == 'file-upload-only' or user_input.lower() == 'fuo':
-                print("Usage: fuo <file1> [file2] [file3] ...")
-                print("Example: fuo /path/to/file1.txt /path/to/file2.md")
-                continue
-            elif user_input.lower() == 'show-files' or user_input.lower() == 'sf':
-                if pending_files:
-                    print(f"\nCurrent pending files ({len(pending_files)}):")
-                    for i, file_path in enumerate(pending_files, 1):
-                        file_name = Path(file_path).name
-                        file_size = Path(file_path).stat().st_size if Path(file_path).exists() else "unknown"
-                        print(f"  {i}. {file_name} ({file_size} bytes)")
-                else:
-                    print("No pending files")
-                continue
-            elif user_input.lower() == 'clear-files' or user_input.lower() == 'cf':
+            if line.startswith(":use "):
+                current_conv = line[5:].strip()
                 pending_files.clear()
-                print("All pending files cleared")
+                print(f"Switched to {current_conv}")
                 continue
-            elif user_input.lower().startswith('remove-file ') or user_input.lower().startswith('rf '):
+            if line == ":messages":
+                if not current_conv:
+                    print("No active conversation.")
+                    continue
+                h = client._load_history(current_conv)
+                for i, m in enumerate(h):
+                    role = "U" if m["role"] == "user" else "A"
+                    c = m["content"]
+                    prev = c[:80] if isinstance(c, str) else "[blocks]"
+                    print(f"[{i}] {role}: {prev}")
+                continue
+            if line == ":on-think":
+                client.thinking_enabled = True
+                print("Thinking mode ON.")
+                continue
+            if line == ":off-think":
+                client.thinking_enabled = False
+                print("Thinking mode OFF.")
+                continue
+            if line == ":look-token":
+                client.look_token()
+                continue
+            if line.startswith(":file "):
+                fp = line[6:].strip()
+                if fp:
+                    pending_files.append(fp)
+                    print(f"Added pending file: {Path(fp).name}")
+                continue
+            if line == ":show-files":
+                if pending_files:
+                    for i, f in enumerate(pending_files):
+                        print(f"  {i}. {f}")
+                else:
+                    print("No pending files.")
+                continue
+            if line.startswith(":remove-file "):
                 try:
-                    index = int(user_input.split()[-1]) - 1
-                    if 0 <= index < len(pending_files):
-                        removed_file = pending_files.pop(index)
-                        print(f"Removed from pending list: {Path(removed_file).name}")
-                    else:
-                        print("Invalid file index")
+                    idx = int(line.split()[-1])
+                    removed = pending_files.pop(idx)
+                    print(f"Removed: {Path(removed).name}")
                 except (ValueError, IndexError):
-                    print("Please use the correct format: remove-file <number> or rf <number>")
+                    print("Usage: :remove-file <index>")
                 continue
-            elif user_input.lower().startswith('file '):
-                file_path = user_input[5:].strip()
-                if file_path:
-                    # Add file to pending list
+            if line == ":clear-files":
+                pending_files.clear()
+                print("Pending files cleared.")
+                continue
+            if line == ":retry" or line.startswith(":retry "):
+                if not current_conv:
+                    print("No active conversation.")
+                    continue
+                if line == ":retry":
+                    h = client._load_history(current_conv)
+                    idx = None
+                    for i in range(len(h) - 1, -1, -1):
+                        if h[i]["role"] == "user":
+                            idx = i
+                            break
+                    if idx is None:
+                        print("No user message to retry.")
+                        continue
+                else:
                     try:
-                        file_info = client.upload_file(file_path, current_conversation_id)
-                        pending_files.append(file_path)
-                        print(f"File uploaded and added to pending list: {file_info['original_name']}")
-                    except Exception as e:
-                        print(f"Failed to process file: {e}")
+                        idx = int(line.split()[1])
+                    except (ValueError, IndexError):
+                        print("Usage: :retry <index>")
+                        continue
+                print(f"Retrying message [{idx}]...")
+                client.retry(current_conv, idx)
                 continue
-            # Send message (including pending files)
-            print(f"\nAI: ", end='')
-            # If there are pending files, send them together with the message
-            if pending_files:
-                client.chat(
-                    message=user_input,
-                    file_paths=pending_files.copy(),  # Use a copy to avoid modifying the original list
-                    conversation_id=current_conversation_id
-                )
-                pending_files.clear()  # Clear pending files after sending
-            else:
-                client.chat(
-                    message=user_input,
-                    conversation_id=current_conversation_id
-                )
-            # Update conversation ID
-            if not current_conversation_id and client.history:
-                current_conversation_id = client.history[-1]['id']
+            if line == ":delete" or line.startswith(":delete "):
+                if line == ":delete":
+                    if not current_conv:
+                        print("No active conversation.")
+                        continue
+                    client.delete_conversation(current_conv)
+                    current_conv = None
+                else:
+                    cid = line[8:].strip()
+                    client.delete_conversation(cid)
+                    if current_conv == cid:
+                        current_conv = None
+                continue
+
+            # ---- normal message ----
+            reply = client.chat(
+                text=line,
+                file_paths=pending_files.copy(),
+                conv_id=current_conv,
+                stream=True,
+            )
+            pending_files.clear()
+            if current_conv is None and client.current_conv_id:
+                current_conv = client.current_conv_id
         except KeyboardInterrupt:
-            print("\n\nGoodbye!")
+            print("\nBye.")
             break
         except Exception as e:
             print(f"Error: {e}")
 
-def show_help():
-    """Display help information"""
-    help_text = """
-Available commands:
-  help                    - Show help
-  exit                    - Exit the program
-  new                     - Start a new conversation
-  list                    - List conversation history
-  show <conversation_id>  - Show conversation details
-  use <conversation_id>   - Switch to a specific conversation
-  messages (msgs)         - Show the message list of the current conversation
-  
-Retry features:
-  retry (r)               - Retry the last user message
-  retry <index> (r <index>) - Retry the user message at the specified index
-  
-File management:
-  file-upload-only (fuo)  - Upload files only, without analysis
-  file <file_path>        - Upload a file (compatibility mode)
-  show-files (sf)         - Show the current pending file list
-  remove-file <number> (rf) - Remove a file from the pending list
-  clear-files (cf)        - Clear all pending files
-  
-Simply type text to chat with the AI.
-If there are pending files, they will be sent together with the message.
-    """
-    print(help_text)
 
-if __name__ == '__main__':
+def print_help():
+    print("""
+Commands:
+  :help                 show this help
+  :exit                 quit
+  :new                  start a new conversation
+  :list                 list conversations
+  :show <id>            show conversation details
+  :use <id>             switch to conversation
+  :messages             show message indices of current conversation
+  :retry [index]        retry a message (default: last user)
+  :delete [id]          delete conversation (default: current)
+  :on-think             enable thinking mode
+  :off-think            disable thinking mode (default)
+  :look-token           query account balance
+  :file <path>          add a file to pending list
+  :show-files           list pending files
+  :remove-file <idx>    remove a pending file
+  :clear-files          clear pending files
+
+Type plain text to chat. Pending files are attached to the next message.
+""")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--api-key", default=os.environ.get("DEEPSEEK_API_KEY"))
+    parser.add_argument("--base-url", default=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"))
+    parser.add_argument("--model", default=os.environ.get("DEEPSEEK_MODEL", "deepseek-flash"))
+    args = parser.parse_args()
+
+    if not args.api_key:
+        print("Error: DEEPSEEK_API_KEY not set.")
+        sys.exit(1)
+
+    client = DeepSeekChat(args.api_key, args.base_url, args.model)
+    interactive_mode(client)
+
+
+if __name__ == "__main__":
     main()

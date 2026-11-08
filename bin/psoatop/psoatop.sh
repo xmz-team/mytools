@@ -1,6 +1,5 @@
 #!/bin/sh -e
-#psoatop 'Perform specific operations according'
-
+#psoatop 'Perform Specific Operations According To Optional Packages'
 unset jb
 jbenv="$(dpkg --print-architecture)"
 if [ "$jbenv" = "iphoneos-arm64" ]; then
