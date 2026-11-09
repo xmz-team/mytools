@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 # _myai.py
+# Created by XMZ <xmz-team@outlook.com>
+# Copyright (c) 2026 XMZ <xmz-team@outlook.com>
+# SPDX-License-Identifier: MIT
 
 import os
 import json
@@ -13,12 +16,15 @@ import mimetypes
 import base64
 import subprocess
 import re
+import stat
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 import argparse
 import requests
 
+
+AI_USER = "_deepseekai"
 
 # ---------- permission helpers ----------
 class PermissionManager:
@@ -48,6 +54,60 @@ class PermissionManager:
     def _norm(path: str) -> str:
         return str(Path(path).expanduser().resolve())
 
+    @staticmethod
+    def _is_default_rw(path: str) -> bool:
+        p = Path(path).expanduser().resolve()
+        bases = [Path("/tmp"), Path("/var/tmp")]
+        try:
+            import pwd
+            ai_home = Path(pwd.getpwnam(AI_USER).pw_dir).resolve()
+            bases.append(ai_home)
+        except (KeyError, ImportError):
+            pass
+
+        for base in bases:
+            try:
+                p.relative_to(base)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    @staticmethod
+    def _apply_unix_bits(path_str: str, read: Optional[bool], write: Optional[bool], recursive: bool):
+        """叠加 Unix 权限位：保留原权限，按需加/减 004(read)/002(write)。"""
+        p = Path(path_str).expanduser().resolve()
+        if not p.exists():
+            return
+        targets = []
+        if recursive and p.is_dir():
+            targets.append(p)
+            for root, dirs, files in os.walk(p):
+                for d in dirs:
+                    targets.append(Path(root) / d)
+                for f in files:
+                    targets.append(Path(root) / f)
+        else:
+            targets.append(p)
+
+        for t in targets:
+            try:
+                st = t.stat()
+                mode = stat.S_IMODE(st.st_mode)
+                if read is not None:
+                    if read:
+                        mode |= 0o004
+                    else:
+                        mode &= ~0o004
+                if write is not None:
+                    if write:
+                        mode |= 0o002
+                    else:
+                        mode &= ~0o002
+                os.chmod(t, mode)
+            except (PermissionError, FileNotFoundError, OSError):
+                pass
+
     def chmod(self, path: str, read: Optional[bool], write: Optional[bool], recursive: bool = False):
         key = self._norm(path)
         data = self._load()
@@ -59,10 +119,10 @@ class PermissionManager:
         entry["recursive"] = recursive
         data[key] = entry
         self._save(data)
+        self._apply_unix_bits(key, read, write, recursive)
         return key, entry
 
     def _matches(self, target: str, entry_key: str, recursive: bool) -> bool:
-        """Does target path fall under entry_key (respecting recursive)?"""
         target_p = Path(target)
         base = Path(entry_key)
         try:
@@ -74,6 +134,8 @@ class PermissionManager:
             return False
 
     def can_read(self, path: str) -> bool:
+        if self._is_default_rw(path):
+            return True
         target = self._norm(path)
         for key, entry in self._load().items():
             if self._matches(target, key, entry.get("recursive", False)):
@@ -81,6 +143,8 @@ class PermissionManager:
         return False
 
     def can_write(self, path: str) -> bool:
+        if self._is_default_rw(path):
+            return True
         target = self._norm(path)
         for key, entry in self._load().items():
             if self._matches(target, key, entry.get("recursive", False)):
@@ -89,6 +153,25 @@ class PermissionManager:
 
     def list_entries(self) -> Dict[str, Any]:
         return self._load()
+
+    def reset_all(self):
+        """禁用当前对话所有读写权限。"""
+        data = self._load()
+        for key, entry in data.items():
+            self._apply_unix_bits(key, False, False, entry.get("recursive", False))
+        data = {}
+        self._save(data)
+
+    def activate(self):
+        """根据 allowed.list.json 重新应用 Unix 权限位。"""
+        data = self._load()
+        for key, entry in data.items():
+            self._apply_unix_bits(
+                key,
+                bool(entry.get("read", False)),
+                bool(entry.get("write", False)),
+                entry.get("recursive", False),
+            )
 
 
 # ---------- tool definitions ----------
@@ -162,8 +245,58 @@ TOOLS = [
 ]
 
 
+def ensure_ai_user():
+    """确保 _deepseekai 用户存在，不存在则提示并退出。"""
+    try:
+        r = subprocess.run(
+            ["id", AI_USER],
+            capture_output=True, text=True
+        )
+        if r.returncode != 0:
+            print(f"[error] 用户 '{AI_USER}' 不存在。", file=sys.stderr)
+            print(f"请先创建该用户：", file=sys.stderr)
+            print(f"  sudo useradd -r -m -s /bin/bash {AI_USER}", file=sys.stderr)
+            print(f"  并在 /etc/sudoers.d/{AI_USER} 中配置：", file=sys.stderr)
+            print(f"  Cmnd_Alias DS_BLOCK = /usr/bin/sudo, /bin/sudo", file=sys.stderr)
+            print(f"  {AI_USER} ALL=(ALL) NOPASSWD: ALL, !DS_BLOCK", file=sys.stderr)
+            print(f"  %sudo ALL=({AI_USER}) NOPASSWD: ALL", file=sys.stderr)
+            sys.exit(1)
+    except FileNotFoundError:
+        print("[error] 无法执行 id 命令检查用户", file=sys.stderr)
+        sys.exit(1)
+
+
+def fix_owner_perms(path_str: str):
+    """若路径属主为 _deepseekai，则统一 777（保留其它权限位基础上）。"""
+    p = Path(path_str).expanduser().resolve()
+    if not p.exists():
+        return
+    try:
+        import pwd
+        ai_uid = pwd.getpwnam(AI_USER).pw_uid
+    except (KeyError, ImportError):
+        return
+
+    targets = [p]
+    if p.is_dir():
+        for root, dirs, files in os.walk(p):
+            for d in dirs:
+                targets.append(Path(root) / d)
+            for f in files:
+                targets.append(Path(root) / f)
+
+    for t in targets:
+        try:
+            st = t.stat()
+            if st.st_uid == ai_uid:
+                mode = stat.S_IMODE(st.st_mode) | 0o777
+                os.chmod(t, mode)
+        except (PermissionError, FileNotFoundError, OSError):
+            pass
+
+
 class DeepSeekChat:
-    def __init__(self, api_key: str, base_url: str = "https://api.deepseek.com", model: str = "deepseek-flash"):
+    def __init__(self, api_key: str, base_url: str = "https://api.deepseek.com", model: str = "deepseek-flash", ai_password: Optional[str] = None):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -173,9 +306,8 @@ class DeepSeekChat:
         self.thinking_enabled = False
         self.network_enabled = False
         self._perm: Optional[PermissionManager] = None
-        self._load_conv_index()
+        self.ai_password = ai_password or os.environ.get("AI_PASSWORD")
 
-    # ---------- per-conversation storage ----------
     def _conv_dir(self, conv_id: str) -> Path:
         d = self.data_dir / conv_id
         d.mkdir(parents=True, exist_ok=True)
@@ -206,9 +338,6 @@ class DeepSeekChat:
         conn.commit()
         conn.close()
 
-    def _load_conv_index(self):
-        pass
-
     def _load_history(self, conv_id: str) -> List[Dict[str, Any]]:
         p = self._history_path(conv_id)
         if p.exists():
@@ -236,6 +365,19 @@ class DeepSeekChat:
         if self._perm is None or self._perm.conv_id != conv_id:
             self._perm = PermissionManager(self.data_dir, conv_id)
         return self._perm
+
+    def switch_conversation(self, old_conv: Optional[str], new_conv: Optional[str]):
+        """切换对话时禁用旧对话权限，启用新对话权限。"""
+        if old_conv and old_conv != new_conv:
+            try:
+                self._get_perm(old_conv).reset_all()
+            except Exception:
+                pass
+        if new_conv:
+            self._get_perm(new_conv).activate()
+        else:
+            # 新对话：禁用所有（没有旧对话时的兜底）
+            pass
 
     # ---------- file helpers ----------
     def _sha256(self, path: Path) -> str:
@@ -268,7 +410,6 @@ class DeepSeekChat:
         if not src.exists() or not src.is_file():
             raise FileNotFoundError(f"not a file: {src}")
         size = src.stat().st_size
-        checksum = self._sha256(src)
         mime = self._mime(src)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         stored = f"{src.stem}_{ts}{src.suffix}"
@@ -324,26 +465,30 @@ class DeepSeekChat:
         return blocks
 
     # ---------- tool execution ----------
+    def _run_as_ai(self, cmd: str, timeout: int = 120):
+        if not self.ai_password:
+            raise RuntimeError("AI user password not configured")
+        return subprocess.run(
+            ["minisudo", "-p", "-u", AI_USER, "--", "bash", "-lc", "--", cmd],
+            input=f"{self.ai_password}\n",
+            capture_output=True, text=True, timeout=timeout,
+        )
+
     def _exec_tool(self, name: str, args: Dict[str, Any], conv_id: str) -> str:
         perm = self._get_perm(conv_id)
         if name == "run_command":
             cmd = args.get("command", "").strip()
             if not cmd:
                 return "[error] empty command"
-            # Show the command being run
             print(f"\n[run {cmd}]")
-            # Best-effort permission check: extract paths in the command
             blocked = self._command_blocked_by_perm(cmd, perm)
             if blocked:
                 return f"[error] permission denied: {blocked}"
             try:
-                proc = subprocess.run(
-                    cmd, shell=True, capture_output=True, text=True, timeout=120
-                )
+                proc = self._run_as_ai(cmd, timeout=120)
                 out = proc.stdout or ""
                 err = proc.stderr or ""
                 res = out + (("\n[stderr]\n" + err) if err else "")
-                # Print the result next to "AI >:"
                 preview = res.strip()
                 if preview:
                     print(f"AI >: {preview}")
@@ -358,7 +503,9 @@ class DeepSeekChat:
             if not perm.can_read(path):
                 return f"[error] no read permission for {path}"
             try:
-                return Path(path).read_text(encoding="utf-8", errors="replace")[:20000]
+                p = Path(path).expanduser().resolve()
+                fix_owner_perms(str(p))
+                return p.read_text(encoding="utf-8", errors="replace")[:20000]
             except Exception as e:
                 return f"[error] {e}"
 
@@ -368,7 +515,15 @@ class DeepSeekChat:
             if not perm.can_write(path):
                 return f"[error] no write permission for {path}"
             try:
-                Path(path).write_text(content, encoding="utf-8")
+                p = Path(path).expanduser().resolve()
+                # 用 AI 用户写入
+                tmp = p.parent / f".tmp_{uuid.uuid4().hex}"
+                tmp.write_text(content, encoding="utf-8")
+                r = self._run_as_ai(f"mv -f {json.dumps(str(tmp))} {json.dumps(str(p))}")
+                if r.returncode != 0:
+                    tmp.unlink(missing_ok=True)
+                    return f"[error] write failed: {r.stderr}"
+                fix_owner_perms(str(p))
                 return f"[ok] wrote {len(content)} bytes to {path}"
             except Exception as e:
                 return f"[error] {e}"
@@ -379,7 +534,7 @@ class DeepSeekChat:
                 return f"[error] no read permission for {path}"
             try:
                 items = []
-                for p in sorted(Path(path).iterdir()):
+                for p in sorted(Path(path).expanduser().resolve().iterdir()):
                     items.append(p.name + ("/" if p.is_dir() else ""))
                 return "\n".join(items) if items else "[empty]"
             except Exception as e:
@@ -393,15 +548,12 @@ class DeepSeekChat:
         return f"[error] unknown tool: {name}"
 
     def _command_blocked_by_perm(self, cmd: str, perm: PermissionManager) -> Optional[str]:
-        """Very rough heuristic: check for write operators (>, >>, rm, mv, mkdir, touch)
-        referencing paths that lack write permission."""
         write_indicators = re.findall(r'(?:>{1,2}|\b(?:rm|mv|cp|mkdir|touch|tee)\b)\s+([^\s;|&]+)', cmd)
         for target in write_indicators:
             if target.startswith("-"):
                 continue
             if not perm.can_write(target):
                 return f"write not allowed: {target}"
-        # read indicators: cat/less/head/tail/grep <path>
         read_indicators = re.findall(r'\b(?:cat|less|head|tail|grep|wc|awk|sed)\b[^|;]*?\s([^\s;|&]+)', cmd)
         for target in read_indicators:
             if target.startswith("-") or target in ("|", ">"):
@@ -414,7 +566,6 @@ class DeepSeekChat:
         return None
 
     def _web_search(self, query: str) -> str:
-        """Simple web search via DuckDuckGo HTML endpoint (no API key needed)."""
         try:
             r = requests.get(
                 "https://duckduckgo.com/html/",
@@ -424,7 +575,6 @@ class DeepSeekChat:
             )
             r.raise_for_status()
             text = r.text
-            # Extract result snippets crudely
             results = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', text, re.S)
             titles = re.findall(r'class="result__a"[^>]*>(.*?)</a>', text, re.S)
             def clean(s):
@@ -510,18 +660,16 @@ class DeepSeekChat:
         if conv_id is None:
             conv_id = str(uuid.uuid4())
         self._init_db(conv_id)
-        self._get_perm(conv_id)  # ensure allowed.list.json exists
+        self._get_perm(conv_id)
         history = self._load_history(conv_id)
 
         content = self._build_content_with_files(text or "", file_paths or [], conv_id)
         if content:
             history.append({"role": "user", "content": content})
 
-        # Build active tool list (network gated)
         active_tools = [t for t in TOOLS
                         if t["function"]["name"] != "web_search" or self.network_enabled]
 
-        # Agent loop: keep calling model until it stops requesting tools
         max_iters = 12
         for _ in range(max_iters):
             msg, usage = self._post_chat(history, stream=stream, tools=active_tools)
@@ -529,7 +677,6 @@ class DeepSeekChat:
             reply_text = msg.get("content") or ""
 
             if tool_calls:
-                # Record assistant tool-call message
                 history.append({
                     "role": "assistant",
                     "content": reply_text or None,
@@ -548,7 +695,6 @@ class DeepSeekChat:
                         "tool_call_id": tc["id"],
                         "content": result,
                     })
-                # loop continues to let model react to tool results
                 continue
 
             if reply_text.strip():
@@ -557,11 +703,9 @@ class DeepSeekChat:
                 self.current_conv_id = conv_id
                 return reply_text
             else:
-                # empty reply retry
                 print("[empty reply, retrying...]")
                 continue
 
-        # ran out of iterations
         self._save_history(conv_id, history)
         return "[max tool iterations reached]"
 
@@ -593,7 +737,6 @@ class DeepSeekChat:
         self._save_history(conv_id, history)
         return reply["content"]
 
-    # ---------- token / balance ----------
     def look_token(self) -> Dict[str, Any]:
         url = f"{self.base_url}/user/balance"
         headers = {"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"}
@@ -609,7 +752,6 @@ class DeepSeekChat:
             print(f"Failed to query balance: {e}")
             return {"error": str(e)}
 
-    # ---------- conversation management ----------
     def list_conversations(self):
         ids = self._list_conversation_ids()
         if not ids:
@@ -650,14 +792,12 @@ class DeepSeekChat:
             print(f"Not found: {conv_id}")
 
 
-# ---------- status bar ----------
 def status_bar(client: DeepSeekChat) -> str:
     net = "YES" if client.network_enabled else "NO"
     think = "YES" if client.thinking_enabled else "NO"
     return f"[Online Search: {net}] [Deep Thinking: {think}]"
 
 
-# ---------- interactive ----------
 def interactive_mode(client: DeepSeekChat):
     print("DeepSeek Chat — type :help for commands, :exit to quit")
     print(status_bar(client))
@@ -672,13 +812,17 @@ def interactive_mode(client: DeepSeekChat):
             prompt += " > "
             line = input(prompt).strip()
 
-            # Always render status bar at bottom after any input
             if not line:
                 print(status_bar(client))
                 continue
 
-            # ---- commands ----
             if line == ":exit":
+                # 退出前清理当前对话权限
+                if current_conv:
+                    try:
+                        client._get_perm(current_conv).reset_all()
+                    except Exception:
+                        pass
                 print("Bye.")
                 break
             if line == ":help":
@@ -686,6 +830,8 @@ def interactive_mode(client: DeepSeekChat):
                 print(status_bar(client))
                 continue
             if line == ":new":
+                # 禁用旧对话权限，新对话禁用所有
+                client.switch_conversation(current_conv, None)
                 current_conv = None
                 pending_files.clear()
                 print("New conversation.")
@@ -700,9 +846,10 @@ def interactive_mode(client: DeepSeekChat):
                 print(status_bar(client))
                 continue
             if line.startswith(":use "):
-                current_conv = line[5:].strip()
+                new_conv = line[5:].strip()
+                client.switch_conversation(current_conv, new_conv)
+                current_conv = new_conv
                 pending_files.clear()
-                client._get_perm(current_conv)  # ensure permissions file
                 print(f"Switched to {current_conv}")
                 print(status_bar(client))
                 continue
@@ -773,10 +920,8 @@ def interactive_mode(client: DeepSeekChat):
                 print(status_bar(client))
                 continue
 
-            # ---- :chmod command ----
             if line.startswith(":chmod"):
                 if not current_conv:
-                    # create a conversation lazily so permission file exists
                     current_conv = str(uuid.uuid4())
                     client._get_perm(current_conv)
                 handle_chmod(client, current_conv, line)
@@ -827,8 +972,10 @@ def interactive_mode(client: DeepSeekChat):
                 continue
 
             # ---- normal message ----
+            old_conv = current_conv
             if current_conv is None:
                 current_conv = str(uuid.uuid4())
+                client.switch_conversation(old_conv, current_conv)
             reply = client.chat(
                 text=line,
                 file_paths=pending_files.copy(),
@@ -840,6 +987,11 @@ def interactive_mode(client: DeepSeekChat):
                 current_conv = client.current_conv_id
             print(status_bar(client))
         except KeyboardInterrupt:
+            if current_conv:
+                try:
+                    client._get_perm(current_conv).reset_all()
+                except Exception:
+                    pass
             print("\nBye.")
             break
         except Exception as e:
@@ -880,6 +1032,7 @@ def handle_chmod(client: DeepSeekChat, conv_id: str, line: str):
         print(f"Unknown chmod action: {action}")
         return
 
+    fix_owner_perms(key)
     r = "read" if entry.get("read") else "no-read"
     w = "write" if entry.get("write") else "no-write"
     print(f"Permissions for {key} (recursive={entry.get('recursive')}): {r}, {w}")
@@ -927,15 +1080,17 @@ def main():
     parser.add_argument("--api-key", default=os.environ.get("DEEPSEEK_API_KEY"))
     parser.add_argument("--base-url", default=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"))
     parser.add_argument("--model", default=os.environ.get("DEEPSEEK_MODEL", "deepseek-flash"))
+    parser.add_argument("--ai-password", default=os.environ.get("AI_PASSWORD"))
+
     args = parser.parse_args()
 
     if not args.api_key:
         print("Error: DEEPSEEK_API_KEY not set.")
         sys.exit(1)
 
-    client = DeepSeekChat(args.api_key, args.base_url, args.model)
+    ensure_ai_user()
+    client = DeepSeekChat(args.api_key, args.base_url, args.model, ai_password=args.ai_password)
     interactive_mode(client)
-
 
 if __name__ == "__main__":
     main()
